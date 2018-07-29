@@ -25,7 +25,7 @@ def load(validation_size_p, file_name):
     file_name (str): File containing the data
     """
     f = gzip.open(io.data_path + file_name + ".plk.gz", 'rb')
-    data, states, projectors = cPickle.load(f)
+    data, states = cPickle.load(f)
     data = np.array(data)
     states = np.array(states)
     train_val_separation = int(len(data) * (1 - validation_size_p / 100.))
@@ -34,4 +34,4 @@ def load(validation_size_p, file_name):
     validation_data = data[train_val_separation:]
     validation_states = states[train_val_separation:]
     f.close()
-    return (training_data, validation_data, training_states, validation_states, projectors)
+    return (training_data, validation_data, training_states, validation_states)

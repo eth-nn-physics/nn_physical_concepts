@@ -21,13 +21,15 @@ from tqdm import tqdm_notebook
 
 class Network(object):
 
-    def __init__(self, input_size, latent_size,
-                 encoder_num_units=[100, 100], decoder_num_units=[100, 100], name='Unnamed',
+    def __init__(self, latent_size, input_size, time_series_length, output_size,
+                 encoder_num_units=[100, 100], decoder_num_units=[100, 100], euler_num_units=[], name='Unnamed',
                  tot_epochs=0, load_file=None):
         """
         Parameters:
-        input_size: length of a single data vector.
+        input_size: number of time steps used for initial input into the network.
         latent_size: number of latent neurons to be used.
+        time_series_length: number of time steps (although each time step can contain mutliple values).
+        output_size: number of values in each time step (e.g. 2 if each time step is a vector in R^2).
         encoder_num_units, decoder_num_units: Number of neurons in encoder and decoder hidden layers. Everything is fully connected.
         name: Used for tensorboard
         tot_epochs and  load_file are used internally for loading and saving, don't pass anything to them manually.
@@ -41,6 +43,10 @@ class Network(object):
         self.decoder_num_units = decoder_num_units
         self.name = name
         self.tot_epochs = tot_epochs
+        self.euler_num_units = euler_num_units
+        self.output_size = output_size
+        self.time_series_length = time_series_length
+        self.rnn_depth = time_series_length - input_size
 
         # Set up neural network
         self.graph_setup()
@@ -58,7 +64,7 @@ class Network(object):
     #########################################
 
     def train(self, epoch_num, batch_size, learning_rate, training_data, validation_data,
-              beta_fun=lambda x: 0.001, test_step=None):
+              beta_fun=lambda x: 0.001, euler_l2_coeff=1.e-5, test_step=None):
         """
         Trains the network.
         Parameters:
@@ -80,13 +86,11 @@ class Network(object):
                     self.test(validation_data, beta=current_beta)
 
                 for step, data_dict in enumerate(self.gen_batch(training_data, batch_size)):
-
-                    parameter_dict = {self.learning_rate: learning_rate, self.beta: current_beta}
+                    parameter_dict = {self.learning_rate: learning_rate, self.beta: current_beta, self.euler_l2_coeff: euler_l2_coeff}
                     feed_dict = dict(data_dict, **parameter_dict)
-
                     self.session.run(self.training_op, feed_dict=feed_dict)
 
-    def test(self, data, beta=0):
+    def test(self, data, beta=0, l2_coeff=0):
         """
         Test accuracy of neural network by comparing mean of output distribution to actual values.
         Parameters:
@@ -94,7 +98,7 @@ class Network(object):
         """
         with self.graph.as_default():
             data_dict = self.gen_data_dict(data, random_epsilon=False)
-            parameter_dict = {self.beta: beta}
+            parameter_dict = {self.beta: beta, self.euler_l2_coeff: l2_coeff}
             summary = self.session.run(self.all_summaries, feed_dict=dict(data_dict, **parameter_dict))
             self.summary_writer.add_summary(summary, global_step=self.tot_epochs)
 
@@ -124,10 +128,17 @@ class Network(object):
                       'encoder_num_units': self.encoder_num_units,
                       'decoder_num_units': self.decoder_num_units,
                       'tot_epochs': self.tot_epochs,
-                      'name': self.name}
+                      'name': self.name,
+                      'time_series_length': self.time_series_length,
+                      'euler_num_units': self.euler_num_units,
+                      'output_size': self.output_size}
             with open(io.tf_save_path + file_name + '.pkl', 'wb') as f:
                 pickle.dump(params, f)
             print "Saved network to file " + file_name
+
+    #########################################
+    #        Public helper functions        #
+    #########################################
 
     @classmethod
     def from_saved(cls, file_name, change_params={}):
@@ -147,6 +158,12 @@ class Network(object):
     #        Private helper functions       #
     #########################################
 
+    def recon_loss_fun(self, prediction, euler_index):
+        # the full time series goes in strides of output_size (each observation contains output_size data points)
+        ind = self.output_size * self.input_size + self.output_size * (euler_index - 1)
+        observation = self.full_time_series[:, ind: ind + self.output_size]
+        return tf.squared_difference(prediction, observation)
+
     def graph_setup(self):
         """
         Set up the computation graph for the neural network based on the parameters set at initialization
@@ -156,61 +173,126 @@ class Network(object):
             #######################
             # Define placeholders #
             #######################
-            self.input = tf.placeholder(tf.float32, [None, self.input_size], name='input')
+            self.full_time_series = tf.placeholder(tf.float32, [None, self.output_size * self.time_series_length], name='full_time_series')
             self.epsilon = tf.placeholder(tf.float32, [None, self.latent_size], name='epsilon')
             self.learning_rate = tf.placeholder(tf.float32, shape=[], name='learning_rate')
             self.beta = tf.placeholder(tf.float32, shape=[], name='beta')
+            self.euler_l2_coeff = tf.placeholder(tf.float32, shape=[], name='euler_l2_coeff')
 
-            ##########################################
-            # Set up variables and computation graph #
-            ##########################################
-            with tf.variable_scope('encoder'):
-                temp_layer = self.input
+            ##################
+            # Set up encoder #
+            ##################
+            with tf.name_scope('prepare_in1'):
+                self.in1 = self.full_time_series[:, :self.output_size * self.input_size]
+            # input and output dimensions for each of the weight tensors
+            enc_in_num = [self.output_size * self.input_size] + self.encoder_num_units
+            enc_out_num = self.encoder_num_units + [2 * self.latent_size]
 
-                # input and output dimensions for each of the weight tensors
-                enc_in_dims = [self.input_size] + self.encoder_num_units
-                enc_out_dims = self.encoder_num_units + [2 * self.latent_size]
-
-                for k in range(len(enc_in_dims)):
+            encoder_input = self.in1
+            with tf.variable_scope('dynamic_encoder'):
+                previous_enc_layer = encoder_input
+                for k in range(len(enc_out_num)):
                     with tf.variable_scope('{}th_enc_layer'.format(k)):
-                        w = tf.get_variable('w', [enc_in_dims[k], enc_out_dims[k]],
-                                            initializer=tf.initializers.random_normal(stddev=2. / np.sqrt(enc_in_dims[k] + enc_out_dims[k])))
-                        b = tf.get_variable('b', [enc_out_dims[k]],
-                                            initializer=tf.initializers.constant(0.))
-                        squash = ((k + 1) != len(enc_in_dims))  # don't squash latent layer
-                        temp_layer = forwardprop(temp_layer, w, b, name='enc_layer_{}'.format(k), squash=squash)
+                        w = tf.get_variable('w_enc{}'.format(k),
+                                            [enc_in_num[k], enc_out_num[k]],
+                                            initializer=tf.glorot_normal_initializer())
+                        b = tf.get_variable('b_enc{}'.format(k),
+                                            [enc_out_num[k]],
+                                            initializer=tf.random_normal_initializer())
+                        # create next layer
+                        squash = (k != (len(enc_out_num) - 1))
+                        previous_enc_layer = forwardprop(previous_enc_layer, w, b, squash=squash, name='{}th_enc_layer'.format(k))
 
-            with tf.variable_scope('latent_layer'):
-                self.log_sigma = temp_layer[:, :self.latent_size]
-                self.mu = temp_layer[:, self.latent_size:]
-                self.mu_sample = tf.add(self.mu, tf.exp(self.log_sigma) * self.epsilon, name='add_noise')
+            with tf.name_scope('dynamic_state'):
+                pre_state = previous_enc_layer
+                self.state_means = tf.nn.tanh(pre_state[:, :self.latent_size])
+                self.state_log_sigma = tf.clip_by_value(pre_state[:, self.latent_size:], -5., 0.5)
+                self.state_log_sigma = pre_state[:, self.latent_size:]
+            with tf.name_scope('state_sample'):
+                self.state_sample = tf.add(self.state_means, tf.exp(self.state_log_sigma) * self.epsilon, name='add_noise')
             with tf.name_scope('kl_loss'):
-                self.kl_loss = kl_divergence(self.mu, self.log_sigma, dim=self.latent_size)
+                self.kl_loss = kl_divergence(self.state_means, self.state_log_sigma, self.latent_size)
 
-            with tf.variable_scope('decoder'):
-                temp_layer = self.mu_sample
+            ###################################
+            # Set up variables for Euler step #
+            ###################################
+            in_euler = [self.latent_size] + self.euler_num_units
+            out_euler = self.euler_num_units + [self.latent_size]
+            with tf.variable_scope('RNN'):
 
-                dec_in_dims = [self.latent_size] + self.decoder_num_units
-                dec_out_dims = self.decoder_num_units + [self.input_size]
-                for k in range(len(dec_in_dims)):
-                    with tf.variable_scope('{}th_dec_layer'.format(k)):
-                        w = tf.get_variable('w', [dec_in_dims[k], dec_out_dims[k]],
-                                            initializer=tf.initializers.random_normal(stddev=2. / np.sqrt(dec_in_dims[k] + dec_out_dims[k])))
-                        b = tf.get_variable('b', [dec_out_dims[k]],
-                                            initializer=tf.initializers.constant(0.))
-                        squash = ((k + 1) != len(dec_in_dims))  # don't squash latent layer
-                        temp_layer = forwardprop(temp_layer, w, b, name='dec_layer_{}'.format(k), squash=squash)
+                ###################
+                # Prepare decoder #
+                ###################
+                dec_in_num = [self.latent_size] + self.decoder_num_units
+                dec_out_num = self.decoder_num_units + [self.output_size]
+                with tf.variable_scope('decoder_vars'):
+                    self.dec_weights = []
+                    self.dec_biases = []
+                    self.decoder_l2_loss = tf.constant(0.)
+                    for k in range(len(dec_out_num)):
+                        self.dec_weights.append(tf.get_variable('w_dec{}'.format(k),
+                                                                [dec_in_num[k], dec_out_num[k]],
+                                                                initializer=tf.glorot_normal_initializer()))
 
-                self.output = temp_layer
+                        self.dec_biases.append(tf.get_variable('b_dec{}'.format(k),
+                                                               [dec_out_num[k]],
+                                                               initializer=tf.random_normal_initializer()))
+                        self.decoder_l2_loss = self.decoder_l2_loss + tf.nn.l2_loss(self.dec_weights[-1]) + tf.nn.l2_loss(self.dec_biases[-1])
 
-            with tf.name_scope('recon_loss'):
-                self.recon_loss = tf.reduce_mean(tf.reduce_sum(tf.squared_difference(self.input, self.output), axis=1))
+                    def decoder_net(latent_state):
+                        temp_state = latent_state
+                        for k, (w, b) in enumerate(zip(self.dec_weights, self.dec_biases)):
+                            squash = ((k + 1) != len(self.dec_weights))  # don't squash last layer
+                            temp_state = forwardprop(temp_state, w, b, name='{}th_dec_layer'.format(k), squash=squash)
+                        return temp_state
+
+                with tf.variable_scope('euler_vars'):
+                    self.euler_weights = [
+                        tf.get_variable('w_euler{}'.format(k),
+                                        [in_euler[k], out_euler[k]],
+                                        initializer=tf.glorot_normal_initializer())
+                        for k in range(len(out_euler))
+                    ]
+                    self.euler_biases = [
+                        tf.get_variable('b_euler{}'.format(k),
+                                        [out_euler[k]],
+                                        initializer=tf.random_normal_initializer())
+                        for k in range(len(out_euler))
+                    ]
+
+                with tf.name_scope('euler_l2_loss'):
+                    self.euler_l2_loss = tf.add_n([tf.nn.l2_loss(self.euler_weights[i]) for i in range(len(out_euler))])
+
+                ###########################################
+                # Define computation graph for Euler step #
+                ###########################################
+                self.latent_vector_list = [self.state_sample]
+                with tf.name_scope('initial_euler_loss'):
+                    self.decoded_list = [decoder_net(self.state_sample)]
+                    recon_losses_list = [self.recon_loss_fun(self.decoded_list[-1], 0)]
+
+                for s in range(self.rnn_depth):
+                    with tf.name_scope('{}th_euler_step'.format(s + 1)):
+                        temp_state = self.latent_vector_list[-1]
+                        for j, (w, b) in enumerate(zip(self.euler_weights, self.euler_biases)):
+                            # To use the Euler weights, replace this line by
+                            # temp_state = my_activation_function(tf.matmul(temp_state, w) + b)
+                            temp_state = temp_state + b
+                        self.latent_vector_list.append(temp_state)
+                    with tf.name_scope('decode_{}th_euler_step'.format(s + 1)):
+                        self.decoded_list.append(decoder_net(temp_state))
+                        recon_losses_list.append(self.recon_loss_fun(self.decoded_list[-1], s + 1))
+
+                with tf.name_scope('gather_recon_losses'):
+                    self.recon_loss = tf.reduce_mean(tf.stack(recon_losses_list))
 
             #####################
             # Cost and training #
             #####################
             with tf.name_scope('cost'):
-                self.cost = self.recon_loss + self.beta * self.kl_loss
+                self.cost = tf.add_n([self.recon_loss,
+                                      self.beta * self.kl_loss,
+                                      self.euler_l2_coeff * self.euler_l2_loss], name='add_costs')
             with tf.name_scope('optimizer'):
                 optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate)
                 gvs = optimizer.compute_gradients(self.cost)
@@ -220,16 +302,19 @@ class Network(object):
             #########################
             # Tensorboard summaries #
             #########################
-            tf.summary.histogram('latent_means', self.mu)
-            tf.summary.histogram('latent_log_sigma', self.log_sigma)
-            tf.summary.histogram('ouput_means', self.output)
-            tf.summary.scalar('recon_loss', self.recon_loss)
-            tf.summary.scalar('kl_loss', self.kl_loss)
+            tf.summary.histogram('state_means', self.state_means)
+            tf.summary.histogram('state_log_sigma', self.state_log_sigma)
+            for i, (w, b) in enumerate(zip(self.euler_weights, self.euler_biases)):
+                tf.summary.histogram('euler_weight_{}'.format(i), w)
+                tf.summary.histogram('euler_bias_{}'.format(i), b)
             tf.summary.scalar('cost', self.cost)
+            tf.summary.scalar('reconstruction_cost', self.recon_loss)
+            tf.summary.scalar('kl_cost', self.kl_loss)
+            tf.summary.scalar('euler_l2_loss', self.euler_l2_loss)
             tf.summary.scalar('beta', self.beta)
-
+            tf.summary.scalar('L2_coeff', self.euler_l2_coeff)
             self.summary_writer = tf.summary.FileWriter(io.tf_log_path + self.name + '/', graph=self.graph)
-            self.summary_writer.flush()  # write out graph
+            self.summary_writer.flush()
             self.all_summaries = tf.summary.merge_all()
 
     def gen_batch(self, data, batch_size, shuffle=True, random_epsilon=True):
@@ -260,12 +345,12 @@ class Network(object):
             eps = np.random.normal(size=[len(data), self.latent_size])
         else:
             eps = np.zeros([len(data), self.latent_size])
-        return {self.input: data,
+        return {self.full_time_series: data,
                 self.epsilon: eps}
 
     def load(self, file_name):
         """ 
-        Loads network, params as in save 
+        Loads network, params as in save
         """
         with self.graph.as_default():
             saver = tf.train.Saver()
@@ -276,7 +361,6 @@ class Network(object):
 ###########
 # Helpers #
 ###########
-
 
 def forwardprop(x, w, b, squash=True, act_fun=tf.nn.elu, name=''):
     """
