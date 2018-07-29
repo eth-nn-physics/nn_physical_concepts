@@ -21,13 +21,15 @@ from tqdm import tqdm_notebook
 
 class Network(object):
 
-    def __init__(self, input_size, latent_size,
+    def __init__(self, input_size, latent_size, input2_size, output_size,
                  encoder_num_units=[100, 100], decoder_num_units=[100, 100], name='Unnamed',
                  tot_epochs=0, load_file=None):
         """
         Parameters:
         input_size: length of a single data vector.
         latent_size: number of latent neurons to be used.
+        input2_size: number of neurons for 2nd input into decoder.
+        output_size: length of a single label vector.
         encoder_num_units, decoder_num_units: Number of neurons in encoder and decoder hidden layers. Everything is fully connected.
         name: Used for tensorboard
         tot_epochs and  load_file are used internally for loading and saving, don't pass anything to them manually.
@@ -37,6 +39,8 @@ class Network(object):
 
         self.input_size = input_size
         self.latent_size = latent_size
+        self.input2_size = input2_size
+        self.output_size = output_size
         self.encoder_num_units = encoder_num_units
         self.decoder_num_units = decoder_num_units
         self.name = name
@@ -121,6 +125,8 @@ class Network(object):
             saver.save(self.session, io.tf_save_path + file_name + '.ckpt')
             params = {'latent_size': self.latent_size,
                       'input_size': self.input_size,
+                      'input2_size': self.input2_size,
+                      'output_size': self.output_size,
                       'encoder_num_units': self.encoder_num_units,
                       'decoder_num_units': self.decoder_num_units,
                       'tot_epochs': self.tot_epochs,
@@ -160,17 +166,17 @@ class Network(object):
             self.epsilon = tf.placeholder(tf.float32, [None, self.latent_size], name='epsilon')
             self.learning_rate = tf.placeholder(tf.float32, shape=[], name='learning_rate')
             self.beta = tf.placeholder(tf.float32, shape=[], name='beta')
+            self.input2 = tf.placeholder(tf.float32, shape=[None, self.input2_size], name='input2')
+            self.labels = tf.placeholder(tf.float32, shape=[None, self.output_size], name='labels')
 
             ##########################################
             # Set up variables and computation graph #
             ##########################################
             with tf.variable_scope('encoder'):
-                temp_layer = self.input
-
                 # input and output dimensions for each of the weight tensors
                 enc_in_dims = [self.input_size] + self.encoder_num_units
                 enc_out_dims = self.encoder_num_units + [2 * self.latent_size]
-
+                temp_layer = self.input
                 for k in range(len(enc_in_dims)):
                     with tf.variable_scope('{}th_enc_layer'.format(k)):
                         w = tf.get_variable('w', [enc_in_dims[k], enc_out_dims[k]],
@@ -180,18 +186,20 @@ class Network(object):
                         squash = ((k + 1) != len(enc_in_dims))  # don't squash latent layer
                         temp_layer = forwardprop(temp_layer, w, b, name='enc_layer_{}'.format(k), squash=squash)
 
-            with tf.variable_scope('latent_layer'):
+            with tf.name_scope('latent_layer'):
                 self.log_sigma = temp_layer[:, :self.latent_size]
                 self.mu = temp_layer[:, self.latent_size:]
                 self.mu_sample = tf.add(self.mu, tf.exp(self.log_sigma) * self.epsilon, name='add_noise')
+                self.mu_with_input2 = tf.concat([self.mu_sample, self.input2], axis=1)
+
             with tf.name_scope('kl_loss'):
                 self.kl_loss = kl_divergence(self.mu, self.log_sigma, dim=self.latent_size)
 
             with tf.variable_scope('decoder'):
-                temp_layer = self.mu_sample
+                temp_layer = self.mu_with_input2
 
-                dec_in_dims = [self.latent_size] + self.decoder_num_units
-                dec_out_dims = self.decoder_num_units + [self.input_size]
+                dec_in_dims = [self.latent_size + self.input2_size] + self.decoder_num_units
+                dec_out_dims = self.decoder_num_units + [self.output_size]
                 for k in range(len(dec_in_dims)):
                     with tf.variable_scope('{}th_dec_layer'.format(k)):
                         w = tf.get_variable('w', [dec_in_dims[k], dec_out_dims[k]],
@@ -204,7 +212,7 @@ class Network(object):
                 self.output = temp_layer
 
             with tf.name_scope('recon_loss'):
-                self.recon_loss = tf.reduce_mean(tf.reduce_sum(tf.squared_difference(self.input, self.output), axis=1))
+                self.recon_loss = tf.reduce_mean(tf.reduce_sum(tf.squared_difference(self.labels, self.output), axis=1))
 
             #####################
             # Cost and training #
@@ -241,13 +249,13 @@ class Network(object):
         shuffle (bool): if true, data is shuffled before batches are created
         random_epsilon (bool): if true, epsilon is drawn from a normal distribution; otherwise, epsilon=0
         """
-        epoch_size = len(data) / batch_size
+        epoch_size = len(data[0]) / batch_size
         if shuffle:
-            p = np.random.permutation(len(data))
-            data = data[p]
+            p = np.random.permutation(len(data[0]))
+            data = [data[i][p] for i in [0, 1, 2]]
         for i in range(epoch_size):
             batch_slice = slice(i * batch_size, (i + 1) * batch_size)
-            batch = data[batch_slice]
+            batch = [data[j][batch_slice] for j in [0, 1, 2]]
             yield self.gen_data_dict(batch, random_epsilon=random_epsilon)
 
     def gen_data_dict(self, data, random_epsilon=True):
@@ -257,10 +265,12 @@ class Network(object):
         random_epsilon (bool): if true, epsilon is drawn from a normal distribution; otherwise, epsilon=0
         """
         if random_epsilon is True:
-            eps = np.random.normal(size=[len(data), self.latent_size])
+            eps = np.random.normal(size=[len(data[0]), self.latent_size])
         else:
-            eps = np.zeros([len(data), self.latent_size])
-        return {self.input: data,
+            eps = np.zeros([len(data[0]), self.latent_size])
+        return {self.input: data[0],
+                self.input2: data[1],
+                self.labels: data[2],
                 self.epsilon: eps}
 
     def load(self, file_name):
@@ -302,7 +312,7 @@ def initialize_uninitialized(sess):
         sess.run(tf.variables_initializer(not_initialized_vars))
 
 
-def kl_divergence(means, log_sigma, dim, target_sigma=0.1):
+def kl_divergence(means, log_sigma, dim, target_sigma=1.):
     # KL divergence between given distribution and unit Gaussian
     target_sigma = tf.constant(target_sigma, shape=[dim])
     return 1 / 2. * tf.reduce_mean(tf.reduce_sum(1 / target_sigma**2 * means**2 +
