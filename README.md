@@ -1,6 +1,6 @@
 # Discovering physical concepts with neural networks
 
-Code for: R. Iten, T. Metger, H.Wilming, L. del Rio, and R. Renner. "Discovering physical concepts with neural networks" (2018).
+Code for: R. Iten, T. Metger, H.Wilming, L. del Rio, and R. Renner. "Discovering physical concepts with neural networks",[	arXiv:1807.10300](https://arxiv.org/abs/1807.10300) (2018).
 
 This repository contains the trained [Tensorflow](https://www.tensorflow.org) models used in the paper as well as code to load, train and analyze them.
 
@@ -31,7 +31,7 @@ To use the code:
 
 Generated data files are stored in the ``data`` directory. Saved models are stored in the ``tf_save`` directory. Tensorboard logs are stored in the ``tf_log`` directory.
 
-Some documentation is available in the code. For further questions, please contact us directly (<tmetger@ethz.ch>,<itenr@itp.phys.ethz.ch>).
+Some documentation is available in the code. For further questions, please contact us directly.
 
 [1]  Higgins, I. *et al.* beta-VAE: "Learning Basic Visual Concepts with a Constrained Variational Framework", *ICLR* (2017).
 
