@@ -1,4 +1,4 @@
-#   Copyright 2018 SciNet (https://github.com/eth-nn-physics/nn_physical_concepts)
+#   Copyright 2020 SciNet (https://github.com/eth-nn-physics/nn_physical_concepts)
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
