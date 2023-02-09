@@ -4,6 +4,8 @@ Code for: R. Iten, T. Metger, H.Wilming, L. del Rio, and R. Renner. "Discovering
 
 This repository contains the trained [Tensorflow](https://www.tensorflow.org) models used in the paper as well as code to load, train and analyze them.
 
+An overview of how this work relates to other research on the use of AI for the discovery of physical concepts, and recent advances based on this research, are presented in the book ["Artificial Intelligence for Scientific Discoveries"](https://www.amazon.de/Artificial-Intelligence-Scientific-Discoveries-Experimental/dp/3031270185/ref=sr_1_3?__mk_de_DE=ÅMÅŽÕÑ&crid=SZL7B1KF8C4O&keywords=Artificial+Intelligence+for+Scientific+Discoveries&qid=1675959397&sprefix=artificial+intelligence+for+scientific+discoveries%2Caps%2C64&sr=8-3) (2023).
+
 Requires:
 
 - Python 2.7
